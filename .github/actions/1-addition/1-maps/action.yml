@@ -151,15 +151,9 @@ runs:
         DOCKER_HUB_PASSWORD: ${{ inputs.hub_password }}
         GCP_CREDENTIALS: ${{ inputs.credentials }}
       run: |
-        echo "🔄 Syncing secrets from ${{ github.repository }} to ${{ env.TARGET_REPOSITORY }}"
-    
         # Get all secrets from source repository
-        secrets=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
-          "https://api.github.com/repos/${{ github.repository }}/actions/secrets" | jq -r '.secrets[].name')
-
-        for secret in $secrets; do
-          gh secret set $secret --repo ${{ env.TARGET_REPOSITORY }} --body "${!secret}"
-        done
+        secrets=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/${{ github.repository }}/actions/secrets" | jq -r '.secrets[].name')
+        for secret in $secrets; do gh secret set $secret --repo ${{ env.TARGET_REPOSITORY }} --body "${!secret}"; done
 
         #python -m pip -q install --upgrade pip
         #python -m pip -q install -r ${{ inputs.action_path }}/dataFile/requirements.txt
@@ -193,16 +187,43 @@ runs:
         configFile: ${{ inputs.action_path }}/.devcontainer.json
         push: ${{ env.RERUN_RUNNER == 'true' && 'always' || 'never' }}
 
-    - name: 💎 Variables
+    - name: 💎 Delete 15 Oldest Docker Images
       id: variables
       shell: bash
+      env:
+        IMAGE_NAME: "${{ inputs.image_name }}"
+        HUB_USERNAME: "${{ inputs.hub_username }}"
+        HUB_PASSWORD: "${{ inputs.hub_password }}"
+        MAX_DELETIONS: 15  # Hardcoded to delete exactly 15 per run
       run: |
+        # Extract namespace/repo
+        NAMESPACE=${IMAGE_NAME%/*}
+        REPO_NAME=${IMAGE_NAME#*/}
+
         BASE_NAME=$(basename ${{ inputs.image_name }})
+        HUB_TOKEN=$(curl -s -H "Content-Type: application/json" -X POST -d "{\"username\": \"${{ inputs.hub_username }}\", \"password\": \"${{ inputs.hub_password }}\"}" https://hub.docker.com/v2/users/login/ | jq -r .token)
         IFS=', '; array=($(curl -L -s 'https://registry.hub.docker.com/v2/repositories/${{ inputs.image_name }}/tags?page_size=1024' | jq -rc '."results"[]["name"]' | yq eval -P | sed "s/ /, /g"))
         for ((i=0; i < ${#array[@]}; i++)); do
           if [ "${array[$i]}" != "latest" ]; then
-            HUB_TOKEN=$(curl -s -H "Content-Type: application/json" -X POST -d "{\"username\": \"${{ inputs.hub_username }}\", \"password\": \"${{ inputs.hub_password }}\"}" https://hub.docker.com/v2/users/login/ | jq -r .token)
             curl -s -i -X DELETE -H "Accept: application/json" -H "Authorization: JWT $HUB_TOKEN" https://hub.docker.com/v2/namespaces/${{ inputs.hub_username }}/repositories/$BASE_NAME/tags/${array[$i]}
             echo "deleted: ${{ inputs.image_name }}:${array[$i]}"
           fi
         done
+
+        # Get all untagged images from Docker Hub, sorted oldest first
+        IMAGES=$(curl -s -H "Authorization: JWT $HUB_TOKEN" \
+          "https://hub.docker.com/v2/repositories/$IMAGE_NAME/tags/?page_size=100&ordering=last_updated" \
+          | jq -r '.results[] | select(.tag == null or .tag == "") | .digest' \
+          | head -n $MAX_DELETIONS)
+
+        # Delete exactly MAX_DELETIONS oldest images
+        DELETED=0
+        for SHA in $IMAGES; do
+          echo "🗑️ Deleting image $((DELETED+1))/$MAX_DELETIONS: $IMAGE_NAME@${SHA:0:12}..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+            -H "Authorization: JWT $HUB_TOKEN" \
+            "https://hub.docker.com/v2/repositories/$IMAGE_NAME/manifests/$SHA")
+    
+          [ "$RESPONSE" -eq 202 ] && ((DELETED++)) || echo "❌ Failed (HTTP $RESPONSE)"
+        done
+        echo "✅ Successfully deleted $DELETED/$MAX_DELETIONS oldest images"
